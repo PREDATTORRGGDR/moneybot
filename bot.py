@@ -40,9 +40,7 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split("
 # Админы, которым не слать алерт о новом пользователе (покупки им приходят как всем)
 NEW_USER_ALERTS_OFF = {int(x) for x in os.getenv("NEW_USER_ALERTS_OFF", "").replace(" ", "").split(",") if x}
 GRAM_AMOUNT = os.getenv("GRAM_AMOUNT", "0.1")
-PRICE_STARS = int(os.getenv("PRICE_STARS", "100"))
-PRICE_TON = os.getenv("PRICE_TON", "")          # пусто = оплата GRAM отключена
-TON_WALLET = os.getenv("TON_WALLET", "")
+TON_WALLET = os.getenv("TON_WALLET", "")        # пусто = оплата GRAM недоступна
 TONCENTER_KEY = os.getenv("TONCENTER_API_KEY", "")
 # Можно несколько через запятую: под каждым будет своя кнопка
 SUPPORT = [u.strip().lstrip("@") for u in os.getenv("SUPPORT_USERNAME", "").split(",") if u.strip()]
@@ -50,15 +48,12 @@ REVIEWS_URL = os.getenv("REVIEWS_URL", "")
 REVIEWS_CHAT_ID = os.getenv("REVIEWS_CHAT_ID", "")
 
 BANNER = os.path.join(os.path.dirname(__file__), "assets", "banner.png")
-TON_ENABLED = bool(PRICE_TON and TON_WALLET)
 
 # Оплата переводом на карту: покупатель переводит рубли и присылает PDF-чек, админ подтверждает вручную.
-# Пусто PRICE_RUB или CARD_NUMBER = способ выключен.
-PRICE_RUB = os.getenv("PRICE_RUB", "")
+# Пусто CARD_NUMBER = способ недоступен. Цену в ₽ можно поменять в /admin.
 CARD_NUMBER = os.getenv("CARD_NUMBER", "").replace(" ", "")
 CARD_BANK = os.getenv("CARD_BANK", "")
 CARD_HOLDER = os.getenv("CARD_HOLDER", "")
-CARD_ENABLED = bool(PRICE_RUB and CARD_NUMBER)
 RECEIPT_MAX_BYTES = 10 * 1024 * 1024
 
 # ---------- база ----------
@@ -71,15 +66,94 @@ db.execute("""CREATE TABLE IF NOT EXISTS orders (
     method TEXT, code TEXT, status TEXT DEFAULT 'new',
     charge_id TEXT UNIQUE, reviewed INTEGER DEFAULT 0, created INTEGER)""")
 db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, first_seen INTEGER)")
-_cols = {r[1] for r in db.execute("PRAGMA table_info(orders)")}
-for _col in ("amount REAL", "paid_at INTEGER", "done_at INTEGER"):
-    if _col.split()[0] not in _cols:
-        db.execute(f"ALTER TABLE orders ADD COLUMN {_col}")
+db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+# Начатые оплаты GRAM и картой. Заказ (с номером) появляется только когда пришёл платёж или чек.
+db.execute("""CREATE TABLE IF NOT EXISTS pending (
+    code TEXT PRIMARY KEY, user_id INTEGER, username TEXT, recipient TEXT,
+    method TEXT, amount TEXT, created INTEGER)""")
+for _table, _new_cols in (("orders", ("amount REAL", "paid_at INTEGER", "done_at INTEGER")),
+                          ("users", ("ref_by INTEGER", "ref_spent INTEGER DEFAULT 0"))):
+    _cols = {r[1] for r in db.execute(f"PRAGMA table_info({_table})")}
+    for _col in _new_cols:
+        if _col.split()[0] not in _cols:
+            db.execute(f"ALTER TABLE {_table} ADD COLUMN {_col}")
+# Неоплаченные заказы больше не храним. Свежие начатые оплаты картой/GRAM переносим в pending,
+# чтобы человек, который уже перевёл деньги, смог прислать чек или нажать «Я оплатил».
+db.execute("""INSERT OR IGNORE INTO pending (code, user_id, username, recipient, method, amount, created)
+              SELECT code, user_id, username, recipient, method,
+                     CASE method WHEN 'card' THEN ? ELSE ? END, created FROM orders
+              WHERE status='new' AND method IN ('card','ton') AND code IS NOT NULL AND created > ?""",
+           (os.getenv("PRICE_RUB", ""), os.getenv("PRICE_TON", ""), int(time.time()) - 86400))
+db.execute("DELETE FROM orders WHERE status='new'")
+db.execute("DELETE FROM pending WHERE created < ?", (int(time.time()) - 7 * 86400,))  # брошенные оплаты
+db.execute("UPDATE sqlite_sequence SET seq=(SELECT COALESCE(MAX(id), 0) FROM orders) WHERE name='orders'")
 db.commit()
+
+
+# ---------- настройки (меняются в /admin → «Цены и способы оплаты») ----------
+
+DEFAULTS = {
+    "price_stars": "35",
+    "price_ton": os.getenv("PRICE_TON", ""),
+    "price_rub": os.getenv("PRICE_RUB", ""),
+    "ref_need": os.getenv("REF_NEED", "5"),
+    "m_stars": "1", "m_ton": "1", "m_card": "1", "m_ref": "1",
+}
+
+
+def cfg(key):
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else DEFAULTS[key]
+
+
+def set_cfg(key, value):
+    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, str(value)))
+    db.commit()
+
+
+def price_stars():
+    return int(cfg("price_stars"))
+
+
+def ref_need():
+    return int(cfg("ref_need"))
+
+
+def method_available(method):
+    """Способ вообще можно включить: для GRAM и карты нужны реквизиты в .env и цена."""
+    if method == "ton":
+        return bool(TON_WALLET and cfg("price_ton"))
+    if method == "card":
+        return bool(CARD_NUMBER and cfg("price_rub"))
+    return True
+
+
+def method_on(method):
+    return method_available(method) and cfg(f"m_{method}") == "1"
+
+
+def ref_stats(user_id):
+    """(приглашено всего, доступно для бесплатной активации)"""
+    invited = db.execute("SELECT COUNT(*) FROM users WHERE ref_by=?", (user_id,)).fetchone()[0]
+    row = db.execute("SELECT ref_spent FROM users WHERE id=?", (user_id,)).fetchone()
+    spent = (row[0] or 0) if row else 0
+    return invited, max(invited - spent, 0)
 
 
 def order(order_id):
     return db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+
+
+def new_order(user_id, username, recipient, method, amount, status="paid", charge_id=None, code=None):
+    """Заказ создаётся только когда оплата пришла (paid) или прислан чек (review)."""
+    now = int(time.time())
+    cur = db.execute(
+        "INSERT INTO orders (user_id, username, recipient, method, code, status, charge_id, amount, created, paid_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (user_id, username, recipient, method, code, status, charge_id, amount, now,
+         now if status == "paid" else None))
+    db.commit()
+    return cur.lastrowid
 
 
 def set_status(order_id, status, charge_id=None, amount=None):
@@ -116,8 +190,15 @@ def main_kb():
 
 def main_text(user):
     name = f"@{user.username}" if user.username else html.escape(user.first_name)
-    ton_line = f"\n🔷 <b>GRAM (TON)</b> — {PRICE_TON} GRAM" if TON_ENABLED else ""
-    ton_line += f"\n💳 <b>Картой</b> — {PRICE_RUB} ₽" if CARD_ENABLED else ""
+    prices = []
+    if method_on("stars"):
+        prices.append(f"Стоимость {GRAM_AMOUNT.replace('.', ',')} GRAM: <b>{price_stars()}</b> ⭐️ <b>Stars</b>")
+    if method_on("ton"):
+        prices.append(f"🔷 <b>GRAM (TON)</b> — {cfg('price_ton')} GRAM")
+    if method_on("card"):
+        prices.append(f"💳 <b>Картой</b> — {cfg('price_rub')} ₽")
+    if method_on("ref"):
+        prices.append(f"🎁 <b>Бесплатно</b> — за {ref_need()} приглашённых друзей (/ref)")
     return (
         "💎 <b>Gram Wallet («Деньги») | Активация кошелька</b>\n\n"
         f"Привет, {name} 🥹\n\n"
@@ -129,7 +210,7 @@ def main_text(user):
         "2. Выбери способ оплаты и укажи @username\n"
         "3. Оплати заказ\n"
         f"4. После подтверждения бот отправит <b>{GRAM_AMOUNT} GRAM</b> 💎\n\n"
-        f"Стоимость {GRAM_AMOUNT.replace('.', ',')} GRAM: <b>{PRICE_STARS}</b> ⭐️ <b>Stars</b>{ton_line}"
+        + "\n".join(prices)
     )
 
 
@@ -152,6 +233,10 @@ class Review(StatesGroup):
 
 class AdminMsg(StatesGroup):
     text = State()
+
+
+class AdminSet(StatesGroup):
+    value = State()
 
 
 async def send_menu(bot: Bot, chat_id, user):
@@ -223,18 +308,76 @@ async def start(m: Message, state: FSMContext, bot: Bot, command: CommandObject)
     cur = db.execute("INSERT OR IGNORE INTO users (id, username, first_seen) VALUES (?,?,?)",
                      (m.from_user.id, m.from_user.username, int(time.time())))
     db.commit()
+    is_new = cur.rowcount == 1
+    # реферал засчитывается только новому человеку, пришедшему по чужой ссылке
+    ref = re.fullmatch(r"ref_(\d+)", command.args or "")
+    inviter = int(ref.group(1)) if ref else None
+    if is_new and inviter and inviter != m.from_user.id \
+            and db.execute("SELECT 1 FROM users WHERE id=?", (inviter,)).fetchone():
+        db.execute("UPDATE users SET ref_by=? WHERE id=?", (inviter, m.from_user.id))
+        db.commit()
+        invited, avail = ref_stats(inviter)
+        try:
+            await bot.send_message(inviter, "👥 По твоей ссылке пришёл новый человек!\n"
+                                            f"Приглашено: <b>{invited}</b>, доступно: <b>{avail}</b> "
+                                            f"из {ref_need()} для бесплатной активации.")
+        except Exception:
+            pass
+    else:
+        inviter = None
     await send_menu(bot, m.chat.id, m.from_user)
-    if cur.rowcount and m.from_user.id not in ADMIN_IDS:
+    if is_new and m.from_user.id not in ADMIN_IDS:
         total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         source = f"\nИсточник: <code>{html.escape(command.args)}</code>" if command.args else ""
+        if inviter:
+            source = f"\nПригласил: <code>{inviter}</code>"
         await notify_admins(bot, f"👤 <b>Новый пользователь</b>\n{user_line(m.from_user)}{source}\n"
                                  f"Всего пользователей: <b>{total}</b>", skip=NEW_USER_ALERTS_OFF)
 
 
+# ---------- рефералы ----------
+
+async def ref_text(bot: Bot, user_id):
+    me = await bot.me()
+    invited, avail = ref_stats(user_id)
+    need = ref_need()
+    text = ("👥 <b>Приглашай друзей</b>\n\n"
+            f"За <b>{need}</b> приглашённых — «Активация кошелька» бесплатно.\n\n"
+            f"Твоя ссылка:\n<code>https://t.me/{me.username}?start=ref_{user_id}</code>\n\n"
+            f"Приглашено: <b>{invited}</b>\nДоступно для активации: <b>{avail}</b> из {need}")
+    if not method_on("ref"):
+        text += "\n\n<i>Бесплатная активация за приглашения сейчас выключена.</i>"
+    return text
+
+
+def refs_short_text(user_id):
+    _, avail = ref_stats(user_id)
+    return ("👥 <b>Рефералов пока не хватает</b>\n\n"
+            f"«Активацию кошелька» делаем за {ref_need()} приглашённых, у тебя {avail}.\n\n"
+            "Приглашай людей по своей ссылке — отправь /ref, и бот покажет её вместе со счётчиком.")
+
+
+def refs_short_kb():
+    return kb([btn("👥 Моя ссылка", "ref", style="success")], [btn("Назад", "act", style="danger")])
+
+
+@router.message(Command("ref"))
+async def ref_cmd(m: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    await m.answer(await ref_text(bot, m.from_user.id), reply_markup=kb([HOME]))
+
+
+@router.callback_query(F.data == "ref")
+async def ref_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.clear()
+    await replace(cb, await ref_text(bot, cb.from_user.id), kb([btn("Назад", "act", style="danger")]))
+
+
 # ---------- админка ----------
 
-STATUS_NAMES = {"new": "🕓 не оплачен", "review": "🧾 чек на проверке", "paid": "⏳ ждёт отправки",
+STATUS_NAMES = {"review": "🧾 чек на проверке", "paid": "⏳ ждёт отправки",
                 "done": "✅ выполнен", "refunded": "↩️ возврат", "cancelled": "❌ отменён"}
+METHOD_NAMES = {"stars": "⭐ Stars", "ton": "🔷 GRAM", "card": "💳 карта", "ref": "🎁 за рефов"}
 
 
 def stats_text():
@@ -249,22 +392,25 @@ def stats_text():
                         ("30 дней", now - 30 * 86400), ("Всё время", 0)):
         cnt = q(f"SELECT COUNT(*) FROM orders WHERE {paid_sql}", since)
         stars = q(f"SELECT COALESCE(SUM(COALESCE(amount, ?)), 0) FROM orders WHERE method='stars' AND {paid_sql}",
-                  PRICE_STARS, since)
+                  price_stars(), since)
         gram = q(f"SELECT COALESCE(SUM(COALESCE(amount, 0)), 0) FROM orders WHERE method='ton' AND {paid_sql}",
                  since)
         rub = q(f"SELECT COALESCE(SUM(COALESCE(amount, 0)), 0) FROM orders WHERE method='card' AND {paid_sql}",
                 since)
+        free = q(f"SELECT COUNT(*) FROM orders WHERE method='ref' AND {paid_sql}", since)
         users = q("SELECT COUNT(*) FROM users WHERE first_seen >= ?", since)
-        money = f"{stars:g} ⭐" + (f" + {gram:g} GRAM" if gram else "") + (f" + {rub:g} ₽" if rub else "")
+        money = (f"{stars:g} ⭐" + (f" + {gram:g} GRAM" if gram else "") + (f" + {rub:g} ₽" if rub else "")
+                 + (f" + {free} за рефов" if free else ""))
         lines.append(f"<b>{name}:</b> продаж {cnt} · {money} · новых {users}")
 
     users_total = q("SELECT COUNT(*) FROM users")
+    referred = q("SELECT COUNT(*) FROM users WHERE ref_by IS NOT NULL")
     buyers = q("SELECT COUNT(DISTINCT user_id) FROM orders WHERE status IN ('paid','done')")
     done = q("SELECT COUNT(*) FROM orders WHERE status='done'")
     conv = f"{buyers / users_total * 100:.1f}%" if users_total else "—"
     lines += [
         "",
-        f"👥 Пользователей: <b>{users_total}</b>",
+        f"👥 Пользователей: <b>{users_total}</b> (по реф. ссылкам {referred})",
         f"🛒 Покупателей: <b>{buyers}</b> (конверсия {conv})",
         f"💎 Отправлено GRAM: <b>{done * float(GRAM_AMOUNT):g}</b>",
         "",
@@ -281,7 +427,8 @@ def admin_kb():
     return kb(
         [btn("🔄 Обновить", "adm:stats", style="primary")],
         [btn(f"⏳ Ждут отправки ({pending})", "adm:pending", style="success" if pending else None)],
-        [btn("📋 Последние заказы", "adm:last")],
+        [btn("📋 Все заказы", "adm:orders:0")],
+        [btn("⚙️ Цены и способы оплаты", "adm:set")],
     )
 
 
@@ -311,19 +458,127 @@ async def admin_pending(cb: CallbackQuery):
         await cb.message.answer(text, reply_markup=markup)
 
 
-@router.callback_query(F.data == "adm:last", F.from_user.id.in_(ADMIN_IDS))
-async def admin_last(cb: CallbackQuery):
-    rows = db.execute("SELECT * FROM orders WHERE status != 'new' ORDER BY id DESC LIMIT 15").fetchall()
-    if not rows:
+ORDERS_PAGE = 15
+
+
+@router.callback_query(F.data.regexp(r"^adm:orders:\d+$"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_orders(cb: CallbackQuery):
+    page = int(cb.data.split(":")[2])
+    total = db.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    if not total:
         return await cb.answer("Заказов пока нет", show_alert=True)
-    lines = ["📋 <b>Последние заказы</b>\n"]
+    pages = (total + ORDERS_PAGE - 1) // ORDERS_PAGE
+    page = min(page, pages - 1)
+    rows = db.execute("SELECT * FROM orders ORDER BY id DESC LIMIT ? OFFSET ?",
+                      (ORDERS_PAGE, page * ORDERS_PAGE)).fetchall()
+    lines = [f"📋 <b>Все заказы</b> ({total}) · стр. {page + 1}/{pages}\n"]
     for o in rows:
         who = f"@{o['username']}" if o["username"] else str(o["user_id"])
         when = time.strftime("%d.%m %H:%M", time.localtime(o["paid_at"] or o["created"]))
         lines.append(f"#{o['id']} · {when} · {html.escape(who)} → {html.escape(o['recipient'])} · "
-                     f"{STATUS_NAMES.get(o['status'], o['status'])}")
-    await cb.message.answer("\n".join(lines))
+                     f"{METHOD_NAMES.get(o['method'], o['method'])} · {STATUS_NAMES.get(o['status'], o['status'])}")
+    nav = []
+    if page > 0:
+        nav.append(btn("◀️ Новее", f"adm:orders:{page - 1}"))
+    if page < pages - 1:
+        nav.append(btn("Старее ▶️", f"adm:orders:{page + 1}"))
     await cb.answer()
+    await edit_screen(cb.message, "\n".join(lines), kb(*([nav] if nav else []), [btn("Назад", "adm:back", style="danger")]))
+
+
+@router.callback_query(F.data == "adm:back", F.from_user.id.in_(ADMIN_IDS))
+async def admin_back(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    await edit_screen(cb.message, stats_text(), admin_kb())
+
+
+# ---------- админка: цены и способы оплаты ----------
+
+def settings_text():
+    lines = ["⚙️ <b>Цены и способы оплаты</b>\n",
+             f"⭐ Цена в Stars: <b>{price_stars()}</b>",
+             f"🔷 Цена в GRAM: <b>{cfg('price_ton') or 'не задана'}</b>",
+             f"💳 Цена картой: <b>{(cfg('price_rub') + ' ₽') if cfg('price_rub') else 'не задана'}</b>",
+             f"🎁 Приглашённых для бесплатной активации: <b>{ref_need()}</b>\n",
+             "<b>Способы оплаты</b> (нажми, чтобы включить или выключить):"]
+    if not TON_WALLET:
+        lines.append("<i>GRAM не включится, пока в .env не указан TON_WALLET.</i>")
+    if not CARD_NUMBER:
+        lines.append("<i>Карта не включится, пока в .env не указан CARD_NUMBER.</i>")
+    return "\n".join(lines)
+
+
+def settings_kb():
+    def toggle(method, name):
+        on = method_on(method)
+        return btn(f"{'✅' if on else '❌'} {name}", f"set:t:{method}", style="success" if on else None)
+
+    rows = [[toggle("stars", "Stars"), toggle("ton", "GRAM")], [toggle("card", "Карта"), toggle("ref", "За рефов")],
+            [btn("✏️ Цена Stars", "set:e:price_stars", style="primary")]]
+    if TON_WALLET:
+        rows.append([btn("✏️ Цена GRAM", "set:e:price_ton", style="primary")])
+    if CARD_NUMBER:
+        rows.append([btn("✏️ Цена картой", "set:e:price_rub", style="primary")])
+    rows += [[btn("✏️ Сколько рефов нужно", "set:e:ref_need", style="primary")],
+             [btn("Назад", "adm:back", style="danger")]]
+    return kb(*rows)
+
+
+SETTING_PROMPTS = {
+    "price_stars": "Пришли новую цену в Stars (целое число), например <code>35</code>",
+    "price_ton": "Пришли новую цену в GRAM, например <code>0.2</code>",
+    "price_rub": "Пришли новую цену в рублях, например <code>150</code>",
+    "ref_need": "Пришли, сколько приглашённых нужно для бесплатной активации, например <code>5</code>",
+}
+
+
+@router.callback_query(F.data == "adm:set", F.from_user.id.in_(ADMIN_IDS))
+async def admin_settings(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    await edit_screen(cb.message, settings_text(), settings_kb())
+
+
+@router.callback_query(F.data.regexp(r"^set:t:(stars|ton|card|ref)$"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_toggle(cb: CallbackQuery):
+    method = cb.data.split(":")[2]
+    if not method_available(method):
+        return await cb.answer("Сначала укажи реквизиты в .env и цену", show_alert=True)
+    set_cfg(f"m_{method}", "0" if cfg(f"m_{method}") == "1" else "1")
+    await cb.answer("Включено" if method_on(method) else "Выключено")
+    await edit_screen(cb.message, settings_text(), settings_kb())
+
+
+@router.callback_query(F.data.regexp(r"^set:e:(price_stars|price_ton|price_rub|ref_need)$"),
+                       F.from_user.id.in_(ADMIN_IDS))
+async def admin_edit(cb: CallbackQuery, state: FSMContext):
+    key = cb.data.split(":")[2]
+    await state.set_state(AdminSet.value)
+    await state.update_data(key=key)
+    await cb.answer()
+    await edit_screen(cb.message, f"✏️ {SETTING_PROMPTS[key]}\n\nСейчас: <b>{cfg(key) or 'не задано'}</b>",
+                      kb([btn("Отмена", "adm:set", style="danger")]))
+
+
+@router.message(StateFilter(AdminSet.value), F.from_user.id.in_(ADMIN_IDS), F.text)
+async def admin_edit_value(m: Message, state: FSMContext):
+    key = (await state.get_data())["key"]
+    t = m.text.strip().replace(",", ".")
+    try:
+        if key in ("price_ton", "price_rub"):
+            ok = Decimal(t) > 0
+            value = format(Decimal(t).normalize(), "f")
+        else:
+            value = int(t)
+            ok = 1 <= value <= (100000 if key == "price_stars" else 1000)
+    except Exception:
+        ok = False
+    if not ok:
+        return await m.answer("Не похоже на правильное число, попробуй ещё раз")
+    set_cfg(key, value)
+    await state.clear()
+    await m.answer("✅ Сохранено\n\n" + settings_text(), reply_markup=settings_kb())
 
 
 # ---------- премиум-иконки ----------
@@ -439,7 +694,7 @@ async def home(cb: CallbackQuery, state: FSMContext, bot: Bot):
 
 SUPPORT_TEXT = ("🆘 <b>Поддержка</b>\n\nЕсли возникла проблема, напиши одному из владельцев: "
                 + ", ".join(f"@{u}" for u in SUPPORT)
-                + ".\n\nУкажи номер заказа, так ответим быстрее.")
+                + ".\n\nУкажи получателя и время оплаты, так ответим быстрее.")
 
 TERMS_TEXT = (
     "📄 <b>Условия перевода</b>\n\n"
@@ -481,20 +736,31 @@ async def terms_cmd(m: Message, state: FSMContext):
 @router.callback_query(F.data == "act")
 async def activation(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    rows = [[btn(f"⭐ Оплата Stars — {PRICE_STARS} ⭐", "pay:stars", style="success")]]
-    if TON_ENABLED:
-        rows.append([btn(f"🔷 Оплата GRAM — {PRICE_TON}", "pay:ton", style="primary")])
-    if CARD_ENABLED:
-        rows.append([btn(f"💳 Оплата картой — {PRICE_RUB} ₽", "pay:card", style="primary")])
+    rows = []
+    if method_on("stars"):
+        rows.append([btn(f"⭐ Оплата Stars — {price_stars()} ⭐", "pay:stars", style="success")])
+    if method_on("ton"):
+        rows.append([btn(f"🔷 Оплата GRAM — {cfg('price_ton')}", "pay:ton", style="primary")])
+    if method_on("card"):
+        rows.append([btn(f"💳 Оплата картой — {cfg('price_rub')} ₽", "pay:card", style="primary")])
+    if method_on("ref"):
+        rows.append([btn("🎁 Получить бесплатно (за рефов)", "pay:ref", style="primary")])
+    text = (f"🪙 <b>Выбери способ оплаты</b>\n\nТы получишь <b>{GRAM_AMOUNT} GRAM</b> на свой кошелёк «Деньги»."
+            if rows else "🪙 Оплата временно недоступна, загляни чуть позже.")
     rows.append([btn("Назад", "home", style="danger")])
-    await replace(cb, f"🪙 <b>Выбери способ оплаты</b>\n\nТы получишь <b>{GRAM_AMOUNT} GRAM</b> "
-                      "на свой кошелёк «Деньги».", kb(*rows))
+    await replace(cb, text, kb(*rows))
 
 
-@router.callback_query(F.data.startswith("pay:"))
+@router.callback_query(F.data.regexp(r"^pay:(stars|ton|card|ref)$"))
 async def ask_recipient(cb: CallbackQuery, state: FSMContext):
+    method = cb.data.split(":")[1]
+    if not method_on(method):
+        return await cb.answer("Этот способ оплаты сейчас недоступен", show_alert=True)
+    if method == "ref" and ref_stats(cb.from_user.id)[1] < ref_need():
+        await state.clear()
+        return await replace(cb, refs_short_text(cb.from_user.id), refs_short_kb())
     await state.set_state(Order.recipient)
-    await state.update_data(method=cb.data.split(":")[1])
+    await state.update_data(method=method)
     rows = []
     if cb.from_user.username:
         rows.append([btn(f"👤 Себе (@{cb.from_user.username})", "me", style="success")])
@@ -510,7 +776,8 @@ ADDRESS_RE = re.compile(r"^(?:[EUk0][Qf][A-Za-z0-9_-]{46}|-?\d:[0-9a-fA-F]{64})$
 async def confirm_screen(state: FSMContext, recipient):
     await state.update_data(recipient=recipient)
     data = await state.get_data()
-    price = {"stars": f"{PRICE_STARS} ⭐", "card": f"{PRICE_RUB} ₽"}.get(data["method"], f"{PRICE_TON} GRAM")
+    price = {"stars": f"{price_stars()} ⭐", "card": f"{cfg('price_rub')} ₽", "ton": f"{cfg('price_ton')} GRAM",
+             "ref": f"бесплатно (спишется {ref_need()} приглашённых)"}[data["method"]]
     text = ("📋 <b>Проверь заказ</b>\n\n"
             f"Получатель: <code>{html.escape(recipient)}</code>\n"
             f"Получит: <b>{GRAM_AMOUNT} GRAM</b>\n"
@@ -546,53 +813,70 @@ async def create_order(cb: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
     if "recipient" not in data:
         return await cb.answer("Сначала укажи получателя", show_alert=True)
+    method, recipient = data["method"], data["recipient"]
+    if not method_on(method):
+        return await cb.answer("Этот способ оплаты сейчас недоступен", show_alert=True)
+    if method == "ref" and ref_stats(cb.from_user.id)[1] < ref_need():
+        await state.clear()
+        return await replace(cb, refs_short_text(cb.from_user.id), refs_short_kb())
     await state.clear()
     code = "MA" + secrets.token_hex(3).upper()
-    cur = db.execute(
-        "INSERT INTO orders (user_id, username, recipient, method, code, created) VALUES (?,?,?,?,?,?)",
-        (cb.from_user.id, cb.from_user.username, data["recipient"], data["method"], code, int(time.time())))
-    db.commit()
-    oid = cur.lastrowid
 
-    if data["method"] == "stars":
-        # Счёт это отдельный тип сообщения, в него экран не превратить: экран становится шапкой заказа
-        await replace(cb, f"🧾 <b>Заказ #{oid}</b>\n\nПолучатель: <code>{html.escape(data['recipient'])}</code>\n"
+    def remember(amount):  # заказ с номером появится, когда придёт платёж или чек
+        db.execute("INSERT INTO pending (code, user_id, username, recipient, method, amount, created) "
+                   "VALUES (?,?,?,?,?,?,?)",
+                   (code, cb.from_user.id, cb.from_user.username, recipient, method, amount, int(time.time())))
+        db.commit()
+
+    if method == "stars":
+        # Счёт это отдельный тип сообщения, в него экран не превратить: экран становится шапкой заказа.
+        # Получатель едет в payload, заказ создаётся только после оплаты.
+        await replace(cb, f"🧾 <b>Активация кошелька</b>\n\nПолучатель: <code>{html.escape(recipient)}</code>\n"
                           f"Получит: <b>{GRAM_AMOUNT} GRAM</b>\n\nОплати счёт ниже 👇", kb([HOME]))
         await bot.send_invoice(
             cb.message.chat.id,
-            title=f"Активация кошелька — {GRAM_AMOUNT} GRAM",
-            description=f"Заказ #{oid}. Получатель: {data['recipient']}",
-            payload=f"order:{oid}",
+            title="Активация кошелька",
+            description=f"Получатель: {recipient}",
+            payload=f"s:{recipient}",
             currency="XTR",
-            prices=[LabeledPrice(label=f"{GRAM_AMOUNT} GRAM", amount=PRICE_STARS)],
+            prices=[LabeledPrice(label=f"{GRAM_AMOUNT} GRAM", amount=price_stars())],
         )
-    elif data["method"] == "card":
+    elif method == "card":
+        remember(cfg("price_rub"))
         await state.set_state(Order.receipt)
-        await state.update_data(order_id=oid)
         holder = " · ".join(x for x in (CARD_BANK, CARD_HOLDER) if x)
         await replace(
             cb,
-            f"💳 <b>Заказ #{oid}, оплата картой</b>\n\n"
-            f"1. Переведи <b>{PRICE_RUB} ₽</b> на карту:\n<code>{CARD_NUMBER}</code>\n{html.escape(holder)}\n\n"
+            "💳 <b>Активация кошелька, оплата картой</b>\n\n"
+            f"1. Переведи <b>{cfg('price_rub')} ₽</b> на карту:\n<code>{CARD_NUMBER}</code>\n{html.escape(holder)}\n\n"
             "2. Сохрани чек в приложении банка в <b>PDF</b> (операция → «Чек» → «Поделиться» → PDF) "
             "и пришли его сюда файлом.\n\n"
             "⚠️ Скриншот не подойдёт, нужен именно PDF-чек. После проверки бот пришлёт уведомление.",
             kb([HOME]))
-    else:
+    elif method == "ton":
+        remember(cfg("price_ton"))
         await replace(
             cb,
-            f"💎 <b>Заказ #{oid}</b>\n\n"
-            f"Отправь <b>{PRICE_TON} GRAM</b> на адрес:\n<code>{TON_WALLET}</code>\n\n"
+            "💎 <b>Активация кошелька</b>\n\n"
+            f"Отправь <b>{cfg('price_ton')} GRAM</b> на адрес:\n<code>{TON_WALLET}</code>\n\n"
             f"С комментарием (обязательно!):\n<code>{code}</code>\n\n"
             "После перевода нажми «Я оплатил».",
-            kb([btn("✅ Я оплатил", f"check:{oid}", style="success")], [HOME]))
+            kb([btn("✅ Я оплатил", f"check:{code}", style="success")], [HOME]))
+    else:  # бесплатно за приглашённых
+        need = ref_need()
+        db.execute("UPDATE users SET ref_spent = COALESCE(ref_spent, 0) + ? WHERE id=?", (need, cb.from_user.id))
+        oid = new_order(cb.from_user.id, cb.from_user.username, recipient, "ref", need)
+        await replace(cb, f"🎁 <b>Заявка принята!</b>\n\nАктивация кошелька: {GRAM_AMOUNT} GRAM → "
+                          f"<code>{html.escape(recipient)}</code>\nСписано приглашённых: {need}.\n"
+                          "Отправим в ближайшее время, бот пришлёт уведомление.", kb([HOME]))
+        await on_paid(bot, oid, notify_buyer=False)
 
 
 # ---------- оплата картой: PDF-чек ----------
 
 def pending_card_order(uid):
-    return db.execute("SELECT * FROM orders WHERE user_id=? AND method='card' AND status='new' "
-                      "ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
+    return db.execute("SELECT * FROM pending WHERE user_id=? AND method='card' "
+                      "ORDER BY created DESC LIMIT 1", (uid,)).fetchone()
 
 
 RECEIPT_HELP = ("Нужен <b>PDF-чек</b> из приложения банка: открой перевод → «Чек» → «Поделиться» → PDF "
@@ -610,17 +894,20 @@ async def receipt_doc(m: Message, state: FSMContext, bot: Bot):
         return await m.answer("❌ Это не PDF. " + RECEIPT_HELP)
     if doc.file_size and doc.file_size > RECEIPT_MAX_BYTES:
         return await m.answer("❌ Файл слишком большой. " + RECEIPT_HELP)
-    set_status(o["id"], "review")
+    rub = float(o["amount"] or 0)
+    oid = new_order(o["user_id"], o["username"], o["recipient"], "card", rub, status="review", code=o["code"])
+    db.execute("DELETE FROM pending WHERE code=?", (o["code"],))
+    db.commit()
     await state.clear()
-    await m.answer(f"🧾 Чек по заказу #{o['id']} получен, проверяем. "
+    await m.answer("🧾 Чек получен, проверяем. "
                    "Обычно это до 15 минут, бот пришлёт уведомление.", reply_markup=kb([HOME]))
-    caption = (f"🧾 <b>Чек на проверке, заказ #{o['id']}</b>\n"
+    caption = (f"🧾 <b>Чек на проверке, заказ #{oid}</b>\n"
                f"Покупатель: {user_line(m.from_user)}\n"
                f"Получатель: <code>{html.escape(o['recipient'])}</code>\n"
-               f"Сумма: <b>{PRICE_RUB} ₽</b> на карту *{CARD_NUMBER[-4:]}\n\n"
+               f"Сумма: <b>{rub:g} ₽</b> на карту *{CARD_NUMBER[-4:]}\n\n"
                "Сверь поступление в банке и нажми кнопку.")
-    markup = kb([btn("✅ Оплата пришла", f"rcpt_ok:{o['id']}", style="success")],
-                [btn("❌ Чек не подходит", f"rcpt_no:{o['id']}", style="danger")],
+    markup = kb([btn("✅ Оплата пришла", f"rcpt_ok:{oid}", style="success")],
+                [btn("❌ Чек не подходит", f"rcpt_no:{oid}", style="danger")],
                 [btn("🔍 Найти покупателя", f"who:{m.from_user.id}", style="primary")])
     for admin in ADMIN_IDS:
         try:
@@ -643,7 +930,7 @@ async def receipt_decision(cb: CallbackQuery, bot: Bot):
                                show_alert=True)
     await cb.answer()
     if action == "ok":
-        set_status(o["id"], "paid", amount=float(PRICE_RUB))
+        set_status(o["id"], "paid", amount=o["amount"] if o["amount"] is not None else float(cfg("price_rub") or 0))
         mark = "✅ Оплата подтверждена"
     else:
         set_status(o["id"], "cancelled")
@@ -657,7 +944,7 @@ async def receipt_decision(cb: CallbackQuery, bot: Bot):
         await on_paid(bot, o["id"])  # покупателю «оплата получена», админам карточка с «Отправил»
     else:
         try:
-            await bot.send_message(o["user_id"], f"❌ Чек по заказу #{o['id']} не подтвердился. "
+            await bot.send_message(o["user_id"], "❌ Чек не подтвердился. "
                                                  "Если деньги списались, напиши в поддержку и приложи чек.",
                                    reply_markup=support_kb())
         except Exception:
@@ -668,26 +955,29 @@ async def receipt_decision(cb: CallbackQuery, bot: Bot):
 
 @router.pre_checkout_query()
 async def pre_checkout(q: PreCheckoutQuery):
-    o = order(int(q.invoice_payload.split(":")[1]))
-    if (o and o["status"] == "new" and o["user_id"] == q.from_user.id
-            and q.total_amount == PRICE_STARS):
-        await q.answer(ok=True)
-    else:
-        await q.answer(ok=False, error_message="Заказ устарел. Создай новый через /start")
+    if not q.invoice_payload.startswith("s:"):  # счета старого формата (с номером заказа)
+        return await q.answer(ok=False, error_message="Счёт устарел. Создай новый через /start")
+    if not method_on("stars") or q.total_amount != price_stars():
+        return await q.answer(ok=False, error_message="Цена изменилась. Создай новый заказ через /start")
+    await q.answer(ok=True)
 
 
 @router.message(F.successful_payment)
 async def paid_stars(m: Message, bot: Bot):
-    oid = int(m.successful_payment.invoice_payload.split(":")[1])
-    set_status(oid, "paid", m.successful_payment.telegram_payment_charge_id, m.successful_payment.total_amount)
+    p = m.successful_payment
+    try:
+        oid = new_order(m.from_user.id, m.from_user.username, p.invoice_payload[2:], "stars",
+                        p.total_amount, charge_id=p.telegram_payment_charge_id)
+    except sqlite3.IntegrityError:
+        return  # этот платёж уже записан
     await on_paid(bot, oid)
 
 
 # ---------- оплата GRAM (TON) ----------
 
-async def find_ton_payment(code):
+async def find_ton_payment(code, amount):
     """Ищет входящий перевод с нужным комментарием и суммой. Возвращает хеш транзакции."""
-    need = int(Decimal(PRICE_TON) * 10**9)
+    need = int(Decimal(amount) * 10**9)
     headers = {"X-API-Key": TONCENTER_KEY} if TONCENTER_KEY else {}
     async with aiohttp.ClientSession(trust_env=True) as s:
         async with s.get("https://toncenter.com/api/v2/getTransactions",
@@ -702,13 +992,18 @@ async def find_ton_payment(code):
 
 @router.callback_query(F.data.startswith("check:"))
 async def check_ton(cb: CallbackQuery, bot: Bot):
-    o = order(int(cb.data.split(":")[1]))
-    if not o or o["user_id"] != cb.from_user.id:
-        return await cb.answer("Заказ не найден", show_alert=True)
-    if o["status"] != "new":
-        return await cb.answer("Оплата уже получена ✅", show_alert=True)
+    arg = cb.data.split(":")[1]
+    if arg.isdigit():  # кнопка из старой версии бота, где был номер заказа
+        p = db.execute("SELECT * FROM pending WHERE user_id=? AND method='ton' ORDER BY created DESC LIMIT 1",
+                       (cb.from_user.id,)).fetchone()
+    else:
+        p = db.execute("SELECT * FROM pending WHERE code=? AND method='ton'", (arg,)).fetchone()
+    if not p or p["user_id"] != cb.from_user.id:
+        if db.execute("SELECT 1 FROM orders WHERE code=? AND user_id=?", (arg, cb.from_user.id)).fetchone():
+            return await cb.answer("Оплата уже получена ✅", show_alert=True)
+        return await cb.answer("Заказ не найден, создай новый через /start", show_alert=True)
     try:
-        tx = await find_ton_payment(o["code"])
+        tx = await find_ton_payment(p["code"], p["amount"])
     except Exception:
         logging.exception("toncenter")
         return await cb.answer("Не удалось проверить, попробуй через минуту", show_alert=True)
@@ -716,23 +1011,27 @@ async def check_ton(cb: CallbackQuery, bot: Bot):
         return await cb.answer("Платёж пока не найден. Если уже отправил — подожди 1–2 минуты "
                                "и нажми ещё раз.", show_alert=True)
     try:
-        set_status(o["id"], "paid", "ton:" + tx, float(PRICE_TON))
+        oid = new_order(p["user_id"], p["username"], p["recipient"], "ton", float(p["amount"]),
+                        charge_id="ton:" + tx, code=p["code"])
     except sqlite3.IntegrityError:
         return await cb.answer("Эта транзакция уже использована", show_alert=True)
+    db.execute("DELETE FROM pending WHERE code=?", (p["code"],))
+    db.commit()
     await cb.message.edit_reply_markup(reply_markup=None)
     await cb.answer()
-    await on_paid(bot, o["id"])
+    await on_paid(bot, oid)
 
 
 # ---------- после оплаты / админ ----------
 
-async def on_paid(bot: Bot, oid):
+async def on_paid(bot: Bot, oid, notify_buyer=True):
     o = order(oid)
     try:  # даже если покупатель заблокировал бота, админы должны узнать об оплате
-        await bot.send_message(o["user_id"],
-                               f"✅ <b>Оплата получена!</b>\n\nЗаказ #{oid}: {GRAM_AMOUNT} GRAM → "
-                               f"<code>{html.escape(o['recipient'])}</code>\n"
-                               "Отправим в ближайшее время, бот пришлёт уведомление.")
+        if notify_buyer:
+            await bot.send_message(o["user_id"],
+                                   f"✅ <b>Оплата получена!</b>\n\nАктивация кошелька: {GRAM_AMOUNT} GRAM → "
+                                   f"<code>{html.escape(o['recipient'])}</code>\n"
+                                   "Отправим в ближайшее время, бот пришлёт уведомление.")
     except Exception:
         logging.warning("buyer notify %s failed", o["user_id"], exc_info=True)
     text, markup = admin_card(o)
@@ -745,8 +1044,8 @@ def admin_card(o):
     """Карточка оплаченного заказа для админа с кнопками."""
     oid = o["id"]
     who = f"@{o['username']}" if o["username"] else f"id {o['user_id']}"
-    unit = {"stars": "⭐", "card": "₽ картой"}.get(o["method"], "GRAM")
-    fallback = {"stars": PRICE_STARS, "card": PRICE_RUB or 0}.get(o["method"], PRICE_TON or 0)
+    unit = {"stars": "⭐", "card": "₽ картой", "ref": "приглашённых (бесплатно)"}.get(o["method"], "GRAM")
+    fallback = {"stars": price_stars(), "card": cfg("price_rub") or 0}.get(o["method"], cfg("price_ton") or 0)
     amount = float(o["amount"] if o["amount"] is not None else fallback)
     second = btn("↩️ Вернуть Stars", f"refund:{oid}", style="danger") if o["method"] == "stars" \
         else btn("❌ Отменить", f"cancel:{oid}", style="danger")
@@ -769,7 +1068,7 @@ async def admin_action(cb: CallbackQuery, bot: Bot):
         set_status(o["id"], "done")
         await bot.send_message(
             o["user_id"],
-            f"🎉 <b>Заказ #{oid} выполнен!</b>\n\n{GRAM_AMOUNT} GRAM отправлен на "
+            f"🎉 <b>Активация выполнена!</b>\n\n{GRAM_AMOUNT} GRAM отправлен на "
             f"<code>{html.escape(o['recipient'])}</code>. Проверь кошелёк «Деньги».\n\n"
             "Будем рады отзыву 🙏",
             reply_markup=kb([btn("✍️ Оставить отзыв", "rev:new", style="success")], [HOME]))
@@ -777,11 +1076,17 @@ async def admin_action(cb: CallbackQuery, bot: Bot):
     elif action == "refund":
         await bot.refund_star_payment(o["user_id"], o["charge_id"])
         set_status(o["id"], "refunded")
-        await bot.send_message(o["user_id"], f"↩️ Заказ #{oid} отменён, Stars возвращены.")
+        await bot.send_message(o["user_id"], "↩️ Заказ отменён, Stars возвращены.")
         mark = "↩️ Возврат"
     else:
         set_status(o["id"], "cancelled")
-        await bot.send_message(o["user_id"], f"❌ Заказ #{oid} отменён. Вопросы — в поддержку.")
+        extra = ""
+        if o["method"] == "ref":  # возвращаем потраченные приглашения
+            db.execute("UPDATE users SET ref_spent = MAX(COALESCE(ref_spent, 0) - ?, 0) WHERE id=?",
+                       (int(o["amount"] or 0), o["user_id"]))
+            db.commit()
+            extra = " Приглашения вернулись на счётчик."
+        await bot.send_message(o["user_id"], f"❌ Заказ отменён.{extra} Вопросы — в поддержку.")
         mark = "❌ Отменён"
 
     await cb.message.edit_text(cb.message.html_text + f"\n\n<b>{mark}</b> ({cb.from_user.first_name})")
@@ -809,7 +1114,7 @@ async def review_new(cb: CallbackQuery, state: FSMContext):
         return await cb.answer("Отзыв можно оставить после выполненного заказа 🙂", show_alert=True)
     await state.set_state(Review.text)
     await state.update_data(order_id=o["id"])
-    await replace(cb, f"✍️ <b>Отзыв о заказе #{o['id']}</b>\n\nНапиши пару слов одним сообщением.",
+    await replace(cb, "✍️ <b>Отзыв о заказе</b>\n\nНапиши пару слов одним сообщением.",
                   kb([btn("Отмена", "rev", style="danger")]))
 
 
@@ -971,11 +1276,13 @@ async def main():
     dp.include_router(router)
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="ref", description="Пригласить друзей"),
     ])
     for admin in ADMIN_IDS:  # админам в меню ещё и /admin
         try:
             await bot.set_my_commands([
                 BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="ref", description="Пригласить друзей"),
                 BotCommand(command="admin", description="Админка и статистика"),
             ], scope=BotCommandScopeChat(chat_id=admin))
         except Exception:
