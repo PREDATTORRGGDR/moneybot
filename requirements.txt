@@ -1,4 +1,3 @@
 aiogram>=3.34
 python-dotenv
 aiohttp-socks
-tonutils==2.5.1
