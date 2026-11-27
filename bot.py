@@ -35,6 +35,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import ton_send  # noqa: E402  читает .env, поэтому после load_dotenv
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x]
 # Админы, которым не слать алерт о новом пользователе (покупки им приходят как всем)
@@ -375,7 +377,7 @@ async def ref_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
 
 # ---------- админка ----------
 
-STATUS_NAMES = {"review": "🧾 чек на проверке", "paid": "⏳ ждёт отправки",
+STATUS_NAMES = {"review": "🧾 чек на проверке", "paid": "⏳ ждёт отправки", "sending": "🤖 отправляется",
                 "done": "✅ выполнен", "refunded": "↩️ возврат", "cancelled": "❌ отменён"}
 METHOD_NAMES = {"stars": "⭐ Stars", "ton": "🔷 GRAM", "card": "💳 карта", "ref": "🎁 за рефов"}
 
@@ -1035,9 +1037,54 @@ async def on_paid(bot: Bot, oid, notify_buyer=True):
     except Exception:
         logging.warning("buyer notify %s failed", o["user_id"], exc_info=True)
     text, markup = admin_card(o)
-    paid_today = db.execute("SELECT COUNT(*) FROM orders WHERE status IN ('paid','done') AND paid_at >= ?",
+    paid_today = db.execute("SELECT COUNT(*) FROM orders WHERE status IN ('paid','sending','done') AND paid_at >= ?",
                             (int(time.time()) - 86400,)).fetchone()[0]
-    await notify_admins(bot, f"💰 <b>Новая покупка!</b> (за 24 ч: {paid_today})\n\n{text}", markup)
+    head = f"💰 <b>Новая покупка!</b> (за 24 ч: {paid_today})\n\n"
+    # Бесплатные заказы за рефов сами не отправляем: рефов легко накрутить фейками, пусть смотрит админ
+    if ton_send.ENABLED and o["method"] != "ref":
+        note, wallet = await auto_send(bot, o)
+        if note is None:
+            return await notify_admins(bot, f"{head}{text}\n\n🤖 <b>GRAM отправлен автоматически</b> · "
+                                            f'<a href="https://tonviewer.com/{wallet}">кошелёк бота</a>')
+        text += note
+    await notify_admins(bot, head + text, markup)
+
+
+async def auto_send(bot: Bot, o):
+    """Сам отправляет GRAM с горячего кошелька. (None, адрес) = ушло; иначе (причина для карточки админа, None)."""
+    # 'sending' защищает от двойной отправки и от кнопки «Отправил» во время перевода
+    if db.execute("UPDATE orders SET status='sending' WHERE id=? AND status='paid'", (o["id"],)).rowcount != 1:
+        return "\n\n⚠️ Автоотправка пропущена: статус заказа уже изменился.", None
+    db.commit()
+    try:
+        wallet = await ton_send.send_gram(o["recipient"], GRAM_AMOUNT)  # без комментария: номер заказа покупателю не показываем
+    except ton_send.NotSent as e:
+        set_status(o["id"], "paid")
+        return f"\n\n⚠️ <b>Автоотправка не удалась</b> (GRAM не ушли): {html.escape(str(e))}\nОтправь вручную.", None
+    except ton_send.Unconfirmed as e:
+        set_status(o["id"], "paid")
+        return (f"\n\n‼️ <b>Автоотправка не подтвердилась</b>: {html.escape(str(e))}\n"
+                "Перевод МОГ уйти: сначала проверь кошелёк бота, не отправляй повторно."), None
+    except Exception as e:
+        logging.exception("auto send #%s", o["id"])
+        set_status(o["id"], "paid")
+        return (f"\n\n‼️ <b>Ошибка автоотправки</b>: {html.escape(str(e))}\n"
+                "Проверь кошелёк бота перед ручной отправкой."), None
+    set_status(o["id"], "done")
+    await notify_done(bot, o)
+    return None, wallet
+
+
+async def notify_done(bot: Bot, o):
+    try:
+        await bot.send_message(
+            o["user_id"],
+            f"🎉 <b>Активация выполнена!</b>\n\n{GRAM_AMOUNT} GRAM отправлен на "
+            f"<code>{html.escape(o['recipient'])}</code>. Проверь кошелёк «Деньги».\n\n"
+            "Будем рады отзыву 🙏",
+            reply_markup=kb([btn("✍️ Оставить отзыв", "rev:new", style="success")], [HOME]))
+    except Exception:
+        logging.warning("buyer notify %s failed", o["user_id"], exc_info=True)
 
 
 def admin_card(o):
@@ -1066,12 +1113,7 @@ async def admin_action(cb: CallbackQuery, bot: Bot):
 
     if action == "done":
         set_status(o["id"], "done")
-        await bot.send_message(
-            o["user_id"],
-            f"🎉 <b>Активация выполнена!</b>\n\n{GRAM_AMOUNT} GRAM отправлен на "
-            f"<code>{html.escape(o['recipient'])}</code>. Проверь кошелёк «Деньги».\n\n"
-            "Будем рады отзыву 🙏",
-            reply_markup=kb([btn("✍️ Оставить отзыв", "rev:new", style="success")], [HOME]))
+        await notify_done(bot, o)
         mark = "✅ Выполнено"
     elif action == "refund":
         await bot.refund_star_payment(o["user_id"], o["charge_id"])
@@ -1287,6 +1329,13 @@ async def main():
             ], scope=BotCommandScopeChat(chat_id=admin))
         except Exception:
             logging.warning("не удалось задать меню админу %s (он ещё не писал боту?)", admin)
+    # бот упал посреди автоотправки: заказ возвращаем админу на ручную проверку
+    for o in db.execute("SELECT * FROM orders WHERE status='sending'").fetchall():
+        set_status(o["id"], "paid")
+        text, markup = admin_card(o)
+        await notify_admins(bot, text + "\n\n‼️ Бот перезапустился во время автоотправки. "
+                                        "Перевод МОГ уйти: проверь кошелёк бота.", markup)
+    logging.info("автоотправка %s", f"включена: {ton_send.WALLET_CLS.__name__}" if ton_send.ENABLED else "выключена")
     await dp.start_polling(bot)
 
 
