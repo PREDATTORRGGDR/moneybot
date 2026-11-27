@@ -1,5 +1,7 @@
 # Секреты и данные покупателей в репо не попадают
 .env
+.env.*
+!.env.example
 *.db
 *.db-journal
 emoji_inbox.json
