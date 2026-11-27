@@ -1,0 +1,9 @@
+# Секреты и данные покупателей в репо не попадают
+.env
+*.db
+*.db-journal
+emoji_inbox.json
+banner_id.txt
+bot.py.*
+__pycache__/
+.venv/

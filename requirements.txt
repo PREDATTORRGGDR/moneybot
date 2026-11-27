@@ -1,0 +1,3 @@
+aiogram>=3.34
+python-dotenv
+aiohttp-socks
