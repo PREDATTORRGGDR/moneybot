@@ -10,12 +10,12 @@ import time
 from decimal import Decimal
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -27,6 +27,8 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
     LabeledPrice,
     Message,
     PreCheckoutQuery,
@@ -46,6 +48,10 @@ TONCENTER_KEY = os.getenv("TONCENTER_API_KEY", "")
 SUPPORT = [u.strip().lstrip("@") for u in os.getenv("SUPPORT_USERNAME", "").split(",") if u.strip()]
 REVIEWS_URL = os.getenv("REVIEWS_URL", "")
 REVIEWS_CHAT_ID = os.getenv("REVIEWS_CHAT_ID", "")
+# Канал, подписка на который нужна, чтобы пользоваться ботом (бот должен быть в нём админом). Пусто = без проверки
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()
+if REQUIRED_CHANNEL and not REQUIRED_CHANNEL.startswith(("@", "-")):
+    REQUIRED_CHANNEL = "@" + REQUIRED_CHANNEL
 
 BANNER = os.path.join(os.path.dirname(__file__), "assets", "banner.png")
 
@@ -71,6 +77,14 @@ db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEX
 db.execute("""CREATE TABLE IF NOT EXISTS pending (
     code TEXT PRIMARY KEY, user_id INTEGER, username TEXT, recipient TEXT,
     method TEXT, amount TEXT, created INTEGER)""")
+# Скриншоты комментариев для бесплатной активации. order_id пуст, пока заявку не отправили на проверку.
+# uniq = file_unique_id: один и тот же файл дважды не засчитывается.
+db.execute("""CREATE TABLE IF NOT EXISTS comment_shots (
+    user_id INTEGER, file_id TEXT, uniq TEXT, kind TEXT, order_id INTEGER, created INTEGER,
+    UNIQUE (user_id, uniq))""")
+# Какие сообщения о заказе получил каждый админ: нажал кнопку один, отметка появляется у всех
+db.execute("""CREATE TABLE IF NOT EXISTS admin_msgs (
+    order_id INTEGER, chat_id INTEGER, message_id INTEGER, html TEXT, is_caption INTEGER)""")
 for _table, _new_cols in (("orders", ("amount REAL", "paid_at INTEGER", "done_at INTEGER")),
                           ("users", ("ref_by INTEGER", "ref_spent INTEGER DEFAULT 0"))):
     _cols = {r[1] for r in db.execute(f"PRAGMA table_info({_table})")}
@@ -97,7 +111,8 @@ DEFAULTS = {
     "price_ton": os.getenv("PRICE_TON", ""),
     "price_rub": os.getenv("PRICE_RUB", ""),
     "ref_need": os.getenv("REF_NEED", "5"),
-    "m_stars": "1", "m_ton": "1", "m_card": "1", "m_ref": "1",
+    "cmt_need": "100",
+    "m_stars": "1", "m_ton": "1", "m_card": "1", "m_ref": "1", "m_comments": "1",
 }
 
 
@@ -117,6 +132,10 @@ def price_stars():
 
 def ref_need():
     return int(cfg("ref_need"))
+
+
+def cmt_need():
+    return int(cfg("cmt_need"))
 
 
 def method_available(method):
@@ -199,6 +218,8 @@ def main_text(user):
         prices.append(f"💳 <b>Картой</b> — {cfg('price_rub')} ₽")
     if method_on("ref"):
         prices.append(f"🎁 <b>Бесплатно</b> — за {ref_need()} приглашённых друзей (/ref)")
+    if method_on("comments"):
+        prices.append(f"💬 <b>Бесплатно</b> — за {cmt_need()} комментариев в TikTok")
     return (
         "💎 <b>Gram Wallet («Деньги») | Активация кошелька</b>\n\n"
         f"Привет, {name} 🥹\n\n"
@@ -225,6 +246,7 @@ banner_id = open(BANNER_ID_FILE).read().strip() if os.path.exists(BANNER_ID_FILE
 class Order(StatesGroup):
     recipient = State()
     receipt = State()  # оплата картой: ждём PDF-чек
+    shots = State()    # бесплатно за комментарии: собираем скриншоты
 
 
 class Review(StatesGroup):
@@ -237,6 +259,10 @@ class AdminMsg(StatesGroup):
 
 class AdminSet(StatesGroup):
     value = State()
+
+
+class AdminBC(StatesGroup):
+    message = State()  # рассылка: ждём сообщение
 
 
 async def send_menu(bot: Bot, chat_id, user):
@@ -296,10 +322,113 @@ async def notify_admins(bot: Bot, text, markup=None, skip=()):
             logging.warning("admin notify %s failed", admin, exc_info=True)
 
 
+async def send_order_to_admins(bot: Bot, oid, text, markup, document=None):
+    """Сообщение о заказе всем админам с запоминанием, чтобы потом отметить решение у всех сразу."""
+    for admin in ADMIN_IDS:
+        try:
+            if document:
+                msg = await bot.send_document(admin, document, caption=text, reply_markup=markup)
+            else:
+                msg = await bot.send_message(admin, text, reply_markup=markup)
+            db.execute("INSERT INTO admin_msgs (order_id, chat_id, message_id, html, is_caption) VALUES (?,?,?,?,?)",
+                       (oid, admin, msg.message_id, text, 1 if document else 0))
+            db.commit()
+        except Exception:
+            logging.warning("order %s to admin %s failed", oid, admin, exc_info=True)
+
+
+async def mark_order(bot: Bot, oid, mark, who):
+    """Решение по заказу («✅ Выполнено (Имя)») дописывается во все сообщения о нём у всех админов, кнопки убираются."""
+    rows = db.execute("SELECT * FROM admin_msgs WHERE order_id=?", (oid,)).fetchall()
+    db.execute("DELETE FROM admin_msgs WHERE order_id=?", (oid,))
+    db.commit()
+    line = f"\n\n<b>{mark}</b> ({html.escape(who)})"
+    marked = set()
+    for r in rows:
+        marked.add((r["chat_id"], r["message_id"]))
+        try:
+            if r["is_caption"]:
+                await bot.edit_message_caption(chat_id=r["chat_id"], message_id=r["message_id"],
+                                               caption=r["html"] + line, reply_markup=None)
+            else:
+                await bot.edit_message_text(r["html"] + line, chat_id=r["chat_id"], message_id=r["message_id"],
+                                            reply_markup=None, disable_web_page_preview=True)
+        except Exception:
+            logging.warning("mark order %s in %s failed", oid, r["chat_id"], exc_info=True)
+    return marked
+
+
 def user_line(u):
     name = html.escape(u.full_name or "")
     nick = f"@{u.username}" if u.username else "без ника"
     return f"{name} ({nick}, <code>{u.id}</code>)"
+
+
+# ---------- обязательная подписка на канал ----------
+
+SUB_OK = {}  # user_id -> до какого времени считаем подписанным (кеш, чтобы не дёргать Telegram на каждый клик)
+SUB_CACHE_SEC = 600
+
+
+async def is_subscribed(bot: Bot, uid):
+    if not REQUIRED_CHANNEL or uid in ADMIN_IDS:
+        return True
+    if SUB_OK.get(uid, 0) > time.time():
+        return True
+    try:
+        member = await bot.get_chat_member(REQUIRED_CHANNEL, uid)
+    except Exception as e:
+        # бота убрали из админов канала или канал недоступен: не блокируем весь бот, только пишем в лог
+        logging.warning("subscription check failed: %s", e)
+        return True
+    ok = member.status in ("creator", "administrator", "member") or getattr(member, "is_member", False)
+    if ok:
+        SUB_OK[uid] = time.time() + SUB_CACHE_SEC
+    return ok
+
+
+def sub_text():
+    return (f"📢 <b>Подпишись на канал</b>\n\nЧтобы пользоваться ботом, подпишись на {REQUIRED_CHANNEL}: "
+            "там новости и акции.\n\nПосле подписки нажми «Я подписался».")
+
+
+def sub_kb():
+    return kb([btn("📢 Подписаться", url=f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}", style="primary")],
+              [btn("✅ Я подписался", "subcheck", style="success")])
+
+
+class SubscriptionGate(BaseMiddleware):
+    """Без подписки на канал бот показывает только экран «Подпишись».
+    Пропускает всегда: /start (там регистрация и рефералы), оплату Stars и файлы (PDF-чеки), чтобы не потерять деньги."""
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if not REQUIRED_CHANNEL or not user or user.id in ADMIN_IDS:
+            return await handler(event, data)
+        if isinstance(event, Message):
+            if (event.chat.type != "private" or event.successful_payment or event.document
+                    or (event.text or "").startswith("/start")):
+                return await handler(event, data)
+        elif isinstance(event, CallbackQuery) and event.data == "subcheck":
+            return await handler(event, data)
+        if await is_subscribed(data["bot"], user.id):
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            return await replace(event, sub_text(), sub_kb())
+        await event.answer(sub_text(), reply_markup=sub_kb())
+
+
+router.message.outer_middleware(SubscriptionGate())
+router.callback_query.outer_middleware(SubscriptionGate())
+
+
+@router.callback_query(F.data == "subcheck")
+async def sub_check(cb: CallbackQuery, bot: Bot):
+    SUB_OK.pop(cb.from_user.id, None)
+    if not await is_subscribed(bot, cb.from_user.id):
+        return await cb.answer("Подписки пока не видно. Подпишись на канал и нажми ещё раз.", show_alert=True)
+    await cb.answer("Спасибо за подписку!")
+    await asyncio.gather(drop(cb.message), send_menu(bot, cb.message.chat.id, cb.from_user))
 
 
 @router.message(CommandStart())
@@ -325,7 +454,10 @@ async def start(m: Message, state: FSMContext, bot: Bot, command: CommandObject)
             pass
     else:
         inviter = None
-    await send_menu(bot, m.chat.id, m.from_user)
+    if await is_subscribed(bot, m.from_user.id):
+        await send_menu(bot, m.chat.id, m.from_user)
+    else:
+        await m.answer(sub_text(), reply_markup=sub_kb())
     if is_new and m.from_user.id not in ADMIN_IDS:
         total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         source = f"\nИсточник: <code>{html.escape(command.args)}</code>" if command.args else ""
@@ -375,9 +507,10 @@ async def ref_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
 
 # ---------- админка ----------
 
-STATUS_NAMES = {"review": "🧾 чек на проверке", "paid": "⏳ ждёт отправки",
+STATUS_NAMES = {"review": "🧾 на проверке", "paid": "⏳ ждёт отправки",
                 "done": "✅ выполнен", "refunded": "↩️ возврат", "cancelled": "❌ отменён"}
-METHOD_NAMES = {"stars": "⭐ Stars", "ton": "🔷 GRAM", "card": "💳 карта", "ref": "🎁 за рефов"}
+METHOD_NAMES = {"stars": "⭐ Stars", "ton": "🔷 GRAM", "card": "💳 карта", "ref": "🎁 за рефов",
+                "comments": "💬 за комменты"}
 
 
 def stats_text():
@@ -398,9 +531,10 @@ def stats_text():
         rub = q(f"SELECT COALESCE(SUM(COALESCE(amount, 0)), 0) FROM orders WHERE method='card' AND {paid_sql}",
                 since)
         free = q(f"SELECT COUNT(*) FROM orders WHERE method='ref' AND {paid_sql}", since)
+        free_cmt = q(f"SELECT COUNT(*) FROM orders WHERE method='comments' AND {paid_sql}", since)
         users = q("SELECT COUNT(*) FROM users WHERE first_seen >= ?", since)
         money = (f"{stars:g} ⭐" + (f" + {gram:g} GRAM" if gram else "") + (f" + {rub:g} ₽" if rub else "")
-                 + (f" + {free} за рефов" if free else ""))
+                 + (f" + {free} за рефов" if free else "") + (f" + {free_cmt} за комменты" if free_cmt else ""))
         lines.append(f"<b>{name}:</b> продаж {cnt} · {money} · новых {users}")
 
     users_total = q("SELECT COUNT(*) FROM users")
@@ -429,6 +563,7 @@ def admin_kb():
         [btn(f"⏳ Ждут отправки ({pending})", "adm:pending", style="success" if pending else None)],
         [btn("📋 Все заказы", "adm:orders:0")],
         [btn("⚙️ Цены и способы оплаты", "adm:set")],
+        [btn("📢 Рассылка всем", "adm:bc", style="primary")],
     )
 
 
@@ -500,7 +635,8 @@ def settings_text():
              f"⭐ Цена в Stars: <b>{price_stars()}</b>",
              f"🔷 Цена в GRAM: <b>{cfg('price_ton') or 'не задана'}</b>",
              f"💳 Цена картой: <b>{(cfg('price_rub') + ' ₽') if cfg('price_rub') else 'не задана'}</b>",
-             f"🎁 Приглашённых для бесплатной активации: <b>{ref_need()}</b>\n",
+             f"🎁 Приглашённых для бесплатной активации: <b>{ref_need()}</b>",
+             f"💬 Комментариев (скриншотов) для бесплатной активации: <b>{cmt_need()}</b>\n",
              "<b>Способы оплаты</b> (нажми, чтобы включить или выключить):"]
     if not TON_WALLET:
         lines.append("<i>GRAM не включится, пока в .env не указан TON_WALLET.</i>")
@@ -515,12 +651,14 @@ def settings_kb():
         return btn(f"{'✅' if on else '❌'} {name}", f"set:t:{method}", style="success" if on else None)
 
     rows = [[toggle("stars", "Stars"), toggle("ton", "GRAM")], [toggle("card", "Карта"), toggle("ref", "За рефов")],
+            [toggle("comments", "За комменты")],
             [btn("✏️ Цена Stars", "set:e:price_stars", style="primary")]]
     if TON_WALLET:
         rows.append([btn("✏️ Цена GRAM", "set:e:price_ton", style="primary")])
     if CARD_NUMBER:
         rows.append([btn("✏️ Цена картой", "set:e:price_rub", style="primary")])
     rows += [[btn("✏️ Сколько рефов нужно", "set:e:ref_need", style="primary")],
+             [btn("✏️ Сколько комментариев нужно", "set:e:cmt_need", style="primary")],
              [btn("Назад", "adm:back", style="danger")]]
     return kb(*rows)
 
@@ -530,6 +668,7 @@ SETTING_PROMPTS = {
     "price_ton": "Пришли новую цену в GRAM, например <code>0.2</code>",
     "price_rub": "Пришли новую цену в рублях, например <code>150</code>",
     "ref_need": "Пришли, сколько приглашённых нужно для бесплатной активации, например <code>5</code>",
+    "cmt_need": "Пришли, сколько комментариев (скриншотов) нужно для бесплатной активации, например <code>100</code>",
 }
 
 
@@ -540,7 +679,7 @@ async def admin_settings(cb: CallbackQuery, state: FSMContext):
     await edit_screen(cb.message, settings_text(), settings_kb())
 
 
-@router.callback_query(F.data.regexp(r"^set:t:(stars|ton|card|ref)$"), F.from_user.id.in_(ADMIN_IDS))
+@router.callback_query(F.data.regexp(r"^set:t:(stars|ton|card|ref|comments)$"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_toggle(cb: CallbackQuery):
     method = cb.data.split(":")[2]
     if not method_available(method):
@@ -550,7 +689,7 @@ async def admin_toggle(cb: CallbackQuery):
     await edit_screen(cb.message, settings_text(), settings_kb())
 
 
-@router.callback_query(F.data.regexp(r"^set:e:(price_stars|price_ton|price_rub|ref_need)$"),
+@router.callback_query(F.data.regexp(r"^set:e:(price_stars|price_ton|price_rub|ref_need|cmt_need)$"),
                        F.from_user.id.in_(ADMIN_IDS))
 async def admin_edit(cb: CallbackQuery, state: FSMContext):
     key = cb.data.split(":")[2]
@@ -745,13 +884,15 @@ async def activation(cb: CallbackQuery, state: FSMContext):
         rows.append([btn(f"💳 Оплата картой — {cfg('price_rub')} ₽", "pay:card", style="primary")])
     if method_on("ref"):
         rows.append([btn("🎁 Получить бесплатно (за рефов)", "pay:ref", style="primary")])
+    if method_on("comments"):
+        rows.append([btn(f"💬 Бесплатно за {cmt_need()} комментариев", "pay:comments", style="primary")])
     text = (f"🪙 <b>Выбери способ оплаты</b>\n\nТы получишь <b>{GRAM_AMOUNT} GRAM</b> на свой кошелёк «Деньги»."
             if rows else "🪙 Оплата временно недоступна, загляни чуть позже.")
     rows.append([btn("Назад", "home", style="danger")])
     await replace(cb, text, kb(*rows))
 
 
-@router.callback_query(F.data.regexp(r"^pay:(stars|ton|card|ref)$"))
+@router.callback_query(F.data.regexp(r"^pay:(stars|ton|card|ref|comments)$"))
 async def ask_recipient(cb: CallbackQuery, state: FSMContext):
     method = cb.data.split(":")[1]
     if not method_on(method):
@@ -759,6 +900,9 @@ async def ask_recipient(cb: CallbackQuery, state: FSMContext):
     if method == "ref" and ref_stats(cb.from_user.id)[1] < ref_need():
         await state.clear()
         return await replace(cb, refs_short_text(cb.from_user.id), refs_short_kb())
+    if method == "comments" and (used := comments_used(cb.from_user.id)):
+        await state.clear()
+        return await replace(cb, comments_used_text(used), kb([btn("Назад", "act", style="danger")]))
     await state.set_state(Order.recipient)
     await state.update_data(method=method)
     rows = []
@@ -777,7 +921,8 @@ async def confirm_screen(state: FSMContext, recipient):
     await state.update_data(recipient=recipient)
     data = await state.get_data()
     price = {"stars": f"{price_stars()} ⭐", "card": f"{cfg('price_rub')} ₽", "ton": f"{cfg('price_ton')} GRAM",
-             "ref": f"бесплатно (спишется {ref_need()} приглашённых)"}[data["method"]]
+             "ref": f"бесплатно (спишется {ref_need()} приглашённых)",
+             "comments": f"бесплатно (за {cmt_need()} комментариев, дальше пришлёшь скриншоты)"}[data["method"]]
     text = ("📋 <b>Проверь заказ</b>\n\n"
             f"Получатель: <code>{html.escape(recipient)}</code>\n"
             f"Получит: <b>{GRAM_AMOUNT} GRAM</b>\n"
@@ -820,6 +965,12 @@ async def create_order(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await state.clear()
         return await replace(cb, refs_short_text(cb.from_user.id), refs_short_kb())
     await state.clear()
+    if method == "comments":  # заказ появится, когда пришлёт скриншоты и отправит на проверку
+        if used := comments_used(cb.from_user.id):
+            return await replace(cb, comments_used_text(used), kb([HOME]))
+        await state.set_state(Order.shots)
+        await state.update_data(recipient=recipient)
+        return await replace(cb, *await shots_screen(bot, cb.from_user.id, recipient))
     code = "MA" + secrets.token_hex(3).upper()
 
     def remember(amount):  # заказ с номером появится, когда придёт платёж или чек
@@ -872,6 +1023,170 @@ async def create_order(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await on_paid(bot, oid, notify_buyer=False)
 
 
+# ---------- бесплатно за комментарии в TikTok ----------
+# Человек оставляет N комментариев с рекламой бота под видео про Telegram-карты и присылает
+# скриншот каждого. Набрал N: отправляет на проверку, админы смотрят скрины и засчитывают.
+# Один раз на человека; после отказа можно собрать новые скриншоты и подать снова.
+
+def comments_used(uid):
+    """Заявка уже на проверке или уже засчитана: второй раз нельзя."""
+    row = db.execute("SELECT status FROM orders WHERE user_id=? AND method='comments' "
+                     "AND status IN ('review','paid','done') ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
+    return row["status"] if row else None
+
+
+def comments_used_text(status):
+    if status == "review":
+        return "💬 Твоя заявка за комментарии уже на проверке. Бот пришлёт уведомление."
+    return "💬 Бесплатную активацию за комментарии ты уже получил. Она даётся один раз."
+
+
+def shots_count(uid):
+    return db.execute("SELECT COUNT(*) FROM comment_shots WHERE user_id=? AND order_id IS NULL",
+                      (uid,)).fetchone()[0]
+
+
+async def shots_screen(bot: Bot, uid, recipient):
+    me = await bot.me()
+    n, need = shots_count(uid), cmt_need()
+    text = ("💬 <b>Бесплатная активация за комментарии</b>\n\n"
+            "1. Найди в TikTok видео про <b>Telegram-карты</b> (активация, кошелёк «Деньги»).\n"
+            f"2. Оставь под ними <b>{need} комментариев</b> с рекламой бота @{me.username}.\n"
+            "3. Сделай скриншот <b>каждого</b> комментария, чтобы были видны видео и твой комментарий, "
+            "и пришли скриншоты сюда (можно альбомами по 10).\n\n"
+            "⚠️ Комментарии под видео на другие темы не засчитаем. Один и тот же скриншот дважды не считается.\n\n"
+            f"Получатель: <code>{html.escape(recipient)}</code>\n"
+            f"Принято скриншотов: <b>{n} из {need}</b>")
+    rows = []
+    if n >= need:
+        rows.append([btn("📤 Отправить на проверку", "cmt:send", style="success")])
+    rows.append([HOME])
+    return text, kb(*rows)
+
+
+SHOT_TASKS = {}  # user_id -> отложенный ответ «принято N из M» (альбом приходит пачкой сообщений)
+
+
+async def shots_progress(bot: Bot, chat_id, uid, recipient):
+    await asyncio.sleep(2)
+    SHOT_TASKS.pop(uid, None)
+    text, markup = await shots_screen(bot, uid, recipient)
+    await bot.send_message(chat_id, text, reply_markup=markup)
+
+
+@router.message(StateFilter(Order.shots), F.photo | F.document)
+async def comment_shot(m: Message, state: FSMContext, bot: Bot):
+    if m.photo:
+        f, kind = m.photo[-1], "photo"
+    elif (m.document.mime_type or "").startswith("image/"):
+        f, kind = m.document, "document"
+    else:
+        return await m.answer("Пришли скриншот картинкой 🙂")
+    db.execute("INSERT OR IGNORE INTO comment_shots (user_id, file_id, uniq, kind, created) VALUES (?,?,?,?,?)",
+               (m.from_user.id, f.file_id, f.file_unique_id, kind, int(time.time())))
+    db.commit()
+    recipient = (await state.get_data()).get("recipient", "")
+    if old := SHOT_TASKS.pop(m.from_user.id, None):
+        old.cancel()
+    SHOT_TASKS[m.from_user.id] = asyncio.create_task(shots_progress(bot, m.chat.id, m.from_user.id, recipient))
+
+
+@router.message(StateFilter(Order.shots))
+async def comment_not_shot(m: Message, state: FSMContext, bot: Bot):
+    text, markup = await shots_screen(bot, m.from_user.id, (await state.get_data()).get("recipient", ""))
+    await m.answer("Сюда нужны скриншоты комментариев.\n\n" + text, reply_markup=markup)
+
+
+async def tg_call(make):
+    """Вызов Telegram с повтором, если упёрлись в лимит (RetryAfter)."""
+    for _ in range(3):
+        try:
+            return await make()
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+    return await make()
+
+
+@router.callback_query(F.data == "cmt:send")
+async def comments_submit(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    uid = cb.from_user.id
+    recipient = (await state.get_data()).get("recipient")
+    if await state.get_state() != Order.shots.state or not recipient:
+        return await cb.answer("Начни заново: «Активация» → «Бесплатно за комментарии». "
+                               "Присланные скриншоты сохранены.", show_alert=True)
+    if used := comments_used(uid):
+        return await cb.answer(comments_used_text(used), show_alert=True)
+    n, need = shots_count(uid), cmt_need()
+    if n < need:
+        return await cb.answer(f"Пока {n} из {need} скриншотов", show_alert=True)
+    await state.clear()
+    oid = new_order(uid, cb.from_user.username, recipient, "comments", n, status="review")
+    db.execute("UPDATE comment_shots SET order_id=? WHERE user_id=? AND order_id IS NULL", (oid, uid))
+    db.commit()
+    await replace(cb, f"📤 <b>Заявка отправлена на проверку</b>\n\nСкриншотов: {n}. "
+                      "Проверим и пришлём уведомление.", kb([HOME]))
+    asyncio.create_task(send_shots_to_admins(bot, oid, cb.from_user, recipient))
+
+
+async def send_shots_to_admins(bot: Bot, oid, user, recipient):
+    shots = db.execute("SELECT file_id, kind FROM comment_shots WHERE order_id=? ORDER BY rowid", (oid,)).fetchall()
+    head = (f"💬 <b>Заявка за комментарии, заказ #{oid}</b>\n"
+            f"Покупатель: {user_line(user)}\n"
+            f"Получатель: <code>{html.escape(recipient)}</code>\n"
+            f"Скриншотов: <b>{len(shots)}</b> (нужно {cmt_need()})\n\n"
+            "Проверь: комментарии в TikTok под видео про Telegram-карты, с рекламой бота. "
+            "Скриншоты ниже, кнопки в конце.")
+    markup = kb([btn("✅ Засчитать", f"cmt_ok:{oid}", style="success")],
+                [btn("❌ Отклонить", f"cmt_no:{oid}", style="danger")],
+                [btn("🔍 Найти покупателя", f"who:{user.id}", style="primary")])
+    for admin in ADMIN_IDS:
+        try:
+            await tg_call(lambda: bot.send_message(admin, head))
+            for kind, media_cls, single in (("photo", InputMediaPhoto, bot.send_photo),
+                                            ("document", InputMediaDocument, bot.send_document)):
+                items = [s["file_id"] for s in shots if s["kind"] == kind]
+                for i in range(0, len(items), 10):
+                    chunk = items[i:i + 10]
+                    if len(chunk) == 1:  # альбом бывает только от 2 штук
+                        await tg_call(lambda: single(admin, chunk[0]))
+                    else:
+                        await tg_call(lambda: bot.send_media_group(admin, [media_cls(media=x) for x in chunk]))
+                    await asyncio.sleep(1)
+            ask = f"💬 Заявка #{oid}: засчитать комментарии?"
+            msg = await tg_call(lambda: bot.send_message(admin, ask, reply_markup=markup))
+            db.execute("INSERT INTO admin_msgs (order_id, chat_id, message_id, html, is_caption) VALUES (?,?,?,?,0)",
+                       (oid, admin, msg.message_id, ask))
+            db.commit()
+        except Exception:
+            logging.warning("comment shots to admin %s failed", admin, exc_info=True)
+
+
+@router.callback_query(F.data.regexp(r"^cmt_(ok|no):\d+$"), F.from_user.id.in_(ADMIN_IDS))
+async def comments_decision(cb: CallbackQuery, bot: Bot):
+    action, oid = cb.data.removeprefix("cmt_").split(":")
+    o = order(int(oid))
+    if not o or o["status"] != "review":  # второй админ уже нажал
+        return await cb.answer(f"Уже обработан: {STATUS_NAMES.get(o['status'], o['status']) if o else '?'}",
+                               show_alert=True)
+    await cb.answer()
+    set_status(o["id"], "paid" if action == "ok" else "cancelled")
+    await mark_order(bot, o["id"], "✅ Засчитано" if action == "ok" else "❌ Отклонено", cb.from_user.first_name)
+    try:
+        if action == "ok":
+            await bot.send_message(o["user_id"], f"🎉 <b>Комментарии засчитаны!</b>\n\nАктивация кошелька: {GRAM_AMOUNT} "
+                                                 f"GRAM → <code>{html.escape(o['recipient'])}</code>\n"
+                                                 "Отправим в ближайшее время, бот пришлёт уведомление.")
+        else:
+            await bot.send_message(o["user_id"], "❌ <b>Комментарии не засчитаны.</b>\n\nПроверь условия: комментарии "
+                                                 "в TikTok под видео про Telegram-карты, скриншот каждого комментария. "
+                                                 "Можно собрать новые скриншоты и подать заявку снова.",
+                                   reply_markup=kb([btn("💎 Активация", "act", style="success")]))
+    except Exception:
+        logging.warning("buyer notify %s failed", o["user_id"], exc_info=True)
+    if action == "ok":
+        await on_paid(bot, o["id"], notify_buyer=False)  # админам карточка с «Отправил»
+
+
 # ---------- оплата картой: PDF-чек ----------
 
 def pending_card_order(uid):
@@ -909,11 +1224,7 @@ async def receipt_doc(m: Message, state: FSMContext, bot: Bot):
     markup = kb([btn("✅ Оплата пришла", f"rcpt_ok:{oid}", style="success")],
                 [btn("❌ Чек не подходит", f"rcpt_no:{oid}", style="danger")],
                 [btn("🔍 Найти покупателя", f"who:{m.from_user.id}", style="primary")])
-    for admin in ADMIN_IDS:
-        try:
-            await bot.send_document(admin, doc.file_id, caption=caption, reply_markup=markup)
-        except Exception:
-            logging.warning("receipt to admin %s failed", admin, exc_info=True)
+    await send_order_to_admins(bot, oid, caption, markup, document=doc.file_id)
 
 
 @router.message(StateFilter(Order.receipt))
@@ -935,11 +1246,7 @@ async def receipt_decision(cb: CallbackQuery, bot: Bot):
     else:
         set_status(o["id"], "cancelled")
         mark = "❌ Чек отклонён"
-    try:
-        await cb.message.edit_caption(caption=(cb.message.html_text or "") +
-                                      f"\n\n<b>{mark}</b> ({html.escape(cb.from_user.first_name)})")
-    except TelegramBadRequest:
-        pass
+    await mark_order(bot, o["id"], mark, cb.from_user.first_name)
     if action == "ok":
         await on_paid(bot, o["id"])  # покупателю «оплата получена», админам карточка с «Отправил»
     else:
@@ -1037,14 +1344,15 @@ async def on_paid(bot: Bot, oid, notify_buyer=True):
     text, markup = admin_card(o)
     paid_today = db.execute("SELECT COUNT(*) FROM orders WHERE status IN ('paid','done') AND paid_at >= ?",
                             (int(time.time()) - 86400,)).fetchone()[0]
-    await notify_admins(bot, f"💰 <b>Новая покупка!</b> (за 24 ч: {paid_today})\n\n{text}", markup)
+    await send_order_to_admins(bot, oid, f"💰 <b>Новая покупка!</b> (за 24 ч: {paid_today})\n\n{text}", markup)
 
 
 def admin_card(o):
     """Карточка оплаченного заказа для админа с кнопками."""
     oid = o["id"]
     who = f"@{o['username']}" if o["username"] else f"id {o['user_id']}"
-    unit = {"stars": "⭐", "card": "₽ картой", "ref": "приглашённых (бесплатно)"}.get(o["method"], "GRAM")
+    unit = {"stars": "⭐", "card": "₽ картой", "ref": "приглашённых (бесплатно)",
+            "comments": "скриншотов комментариев (бесплатно)"}.get(o["method"], "GRAM")
     fallback = {"stars": price_stars(), "card": cfg("price_rub") or 0}.get(o["method"], cfg("price_ton") or 0)
     amount = float(o["amount"] if o["amount"] is not None else fallback)
     second = btn("↩️ Вернуть Stars", f"refund:{oid}", style="danger") if o["method"] == "stars" \
@@ -1066,17 +1374,14 @@ async def admin_action(cb: CallbackQuery, bot: Bot):
 
     if action == "done":
         set_status(o["id"], "done")
-        await bot.send_message(
-            o["user_id"],
-            f"🎉 <b>Активация выполнена!</b>\n\n{GRAM_AMOUNT} GRAM отправлен на "
-            f"<code>{html.escape(o['recipient'])}</code>. Проверь кошелёк «Деньги».\n\n"
-            "Будем рады отзыву 🙏",
-            reply_markup=kb([btn("✍️ Оставить отзыв", "rev:new", style="success")], [HOME]))
+        buyer = (f"🎉 <b>Активация выполнена!</b>\n\n{GRAM_AMOUNT} GRAM отправлен на "
+                 f"<code>{html.escape(o['recipient'])}</code>. Проверь кошелёк «Деньги».\n\nБудем рады отзыву 🙏",
+                 kb([btn("✍️ Оставить отзыв", "rev:new", style="success")], [HOME]))
         mark = "✅ Выполнено"
     elif action == "refund":
         await bot.refund_star_payment(o["user_id"], o["charge_id"])
         set_status(o["id"], "refunded")
-        await bot.send_message(o["user_id"], "↩️ Заказ отменён, Stars возвращены.")
+        buyer = ("↩️ Заказ отменён, Stars возвращены.", None)
         mark = "↩️ Возврат"
     else:
         set_status(o["id"], "cancelled")
@@ -1086,11 +1391,21 @@ async def admin_action(cb: CallbackQuery, bot: Bot):
                        (int(o["amount"] or 0), o["user_id"]))
             db.commit()
             extra = " Приглашения вернулись на счётчик."
-        await bot.send_message(o["user_id"], f"❌ Заказ отменён.{extra} Вопросы — в поддержку.")
+        buyer = (f"❌ Заказ отменён.{extra} Вопросы — в поддержку.", None)
         mark = "❌ Отменён"
 
-    await cb.message.edit_text(cb.message.html_text + f"\n\n<b>{mark}</b> ({cb.from_user.first_name})")
     await cb.answer()
+    # отметка у всех админов; карточка из «Ждут отправки» нигде не запомнена, её правим здесь же
+    marked = await mark_order(bot, o["id"], mark, cb.from_user.first_name)
+    if (cb.message.chat.id, cb.message.message_id) not in marked:
+        try:
+            await cb.message.edit_text(cb.message.html_text + f"\n\n<b>{mark}</b> ({html.escape(cb.from_user.first_name)})")
+        except TelegramBadRequest:
+            pass
+    try:
+        await bot.send_message(o["user_id"], buyer[0], reply_markup=buyer[1])
+    except Exception:  # покупатель заблокировал бота: заказ всё равно отмечен
+        logging.warning("buyer notify %s failed", o["user_id"], exc_info=True)
 
 
 # ---------- отзывы ----------
@@ -1230,6 +1545,84 @@ async def admin_msg_send(m: Message, state: FSMContext, bot: Bot):
         await m.answer(f"✅ Доставлено <code>{uid}</code>. Ответ человека придёт сюда.")
     except Exception as e:
         await m.answer(f"❌ Не доставлено: {html.escape(str(e))[:200]}")
+
+
+# ---------- рассылка всем пользователям ----------
+# Админ присылает любое сообщение (текст, фото, видео, файл, кружок), бот показывает превью
+# и после подтверждения копирует его каждому пользователю от своего имени.
+
+BC_RUNNING = False
+
+
+def users_total():
+    return db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+@router.callback_query(F.data == "adm:bc", F.from_user.id.in_(ADMIN_IDS))
+async def bc_start(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminBC.message)
+    await cb.answer()
+    await cb.message.answer(f"📢 <b>Рассылка всем</b> ({users_total()} пользователей)\n\n"
+                            "Пришли сообщение, которое получат все: текст, фото, видео, файл, что угодно. "
+                            "Перед отправкой покажу, как оно выглядит.",
+                            reply_markup=kb([btn("Отмена", "bc:cancel", style="danger")]))
+
+
+@router.message(StateFilter(AdminBC.message), F.from_user.id.in_(ADMIN_IDS))
+async def bc_preview(m: Message, state: FSMContext, bot: Bot):
+    await state.update_data(chat=m.chat.id, mid=m.message_id)
+    await m.answer("👇 Так его увидят пользователи:")
+    try:
+        await bot.copy_message(m.chat.id, m.chat.id, m.message_id)
+    except TelegramBadRequest as e:
+        return await m.answer(f"❌ Такое сообщение не переслать: {html.escape(str(e))[:150]}")
+    await m.answer(f"Отправить всем <b>{users_total()}</b> пользователям? Можно прислать другое сообщение вместо этого.",
+                   reply_markup=kb([btn("✅ Отправить всем", "bc:go", style="success")],
+                                   [btn("Отмена", "bc:cancel", style="danger")]))
+
+
+@router.callback_query(F.data == "bc:cancel", F.from_user.id.in_(ADMIN_IDS))
+async def bc_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    await edit_screen(cb.message, "Рассылка отменена.", None)
+
+
+@router.callback_query(F.data == "bc:go", F.from_user.id.in_(ADMIN_IDS))
+async def bc_go(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    global BC_RUNNING
+    data = await state.get_data()
+    if await state.get_state() != AdminBC.message.state or "mid" not in data:
+        return await cb.answer("Сначала пришли сообщение для рассылки", show_alert=True)
+    if BC_RUNNING:
+        return await cb.answer("Предыдущая рассылка ещё идёт", show_alert=True)
+    await state.clear()
+    BC_RUNNING = True
+    await cb.answer()
+    await edit_screen(cb.message, f"📢 Рассылка началась ({users_total()} пользователей), пришлю итог.", None)
+    asyncio.create_task(run_broadcast(bot, data["chat"], data["mid"], cb.from_user.id))
+
+
+async def run_broadcast(bot: Bot, from_chat, mid, admin_id):
+    global BC_RUNNING
+    ok = blocked = failed = 0
+    try:
+        for (uid,) in db.execute("SELECT id FROM users").fetchall():
+            if uid == admin_id:
+                continue
+            try:
+                await tg_call(lambda: bot.copy_message(uid, from_chat, mid))
+                ok += 1
+            except TelegramForbiddenError:
+                blocked += 1  # заблокировал бота или удалил аккаунт
+            except Exception:
+                failed += 1
+                logging.warning("broadcast to %s failed", uid, exc_info=True)
+            await asyncio.sleep(0.05)  # ~20 сообщений в секунду, лимит Telegram 30
+    finally:
+        BC_RUNNING = False
+    await notify_admins(bot, f"📢 <b>Рассылка завершена</b>\n\nДоставлено: <b>{ok}</b>\n"
+                             f"Заблокировали бота: {blocked}\nОшибок: {failed}")
 
 
 # ---------- админ прислал набор премиум-эмодзи ----------
